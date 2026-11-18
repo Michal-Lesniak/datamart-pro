@@ -1,0 +1,67 @@
+name: CD Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: "17"}
+      - run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - run: pytest tests/unit/ --cov=src --cov-fail-under=70
+
+  gate-model-quality:
+    name: Model quality gate (AUC ≥ 0.75)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    env:
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install mlflow==2.*
+      - name: Check staging model AUC
+        run: python scripts/check_model_quality.py
+
+  deploy-production:
+    name: Deploy to Databricks production
+    needs: gate-model-quality
+    runs-on: ubuntu-latest
+    environment:
+      name: production           # required reviewers configured w ustawieniach repo
+    env:
+      DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST_PROD }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_PROD }}
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CLIs
+        uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        run: databricks bundle validate --target production
+
+      - name: Deploy bundle
+        run: databricks bundle deploy --target production
+
+      - name: Promote model Staging → Production
+        run: python scripts/promote_model.py
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## CD Production"
+            echo "Deployment ${{ job.status }} for commit ${{ github.sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"

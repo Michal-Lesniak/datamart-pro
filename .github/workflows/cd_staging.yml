@@ -1,0 +1,71 @@
+name: CD Staging
+
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  unit-tests:
+    name: Unit tests gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: "17"}
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: pytest
+        run: pytest tests/unit/ --cov=src --cov-fail-under=70
+
+  deploy-staging:
+    name: Deploy to Databricks staging
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST_STAGING }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_STAGING }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        id: validate
+        run: databricks bundle validate --target staging
+
+      - name: Deploy bundle
+        id: deploy
+        run: databricks bundle deploy --target staging
+
+      - name: Smoke test (ETL job)
+        id: smoke
+        continue-on-error: false
+        run: |
+          RUN_ID=$(databricks bundle run silver_transform_job --target staging --output JSON | jq -r '.run_id')
+          echo "Started run $RUN_ID"
+          STATUS=$(databricks jobs get-run $RUN_ID --output JSON | jq -r '.state.result_state')
+          echo "Final status: $STATUS"
+          if [ "$STATUS" != "SUCCESS" ]; then
+            echo "::error::Smoke test failed with status=$STATUS"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## CD Staging Summary"
+            echo ""
+            echo "| Step | Outcome |"
+            echo "|------|---------|"
+            echo "| bundle validate | ${{ steps.validate.outcome }} |"
+            echo "| bundle deploy   | ${{ steps.deploy.outcome }}   |"
+            echo "| smoke test      | ${{ steps.smoke.outcome }}    |"
+          } >> "$GITHUB_STEP_SUMMARY"
